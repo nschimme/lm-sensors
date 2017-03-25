@@ -42,6 +42,7 @@ PIDFILE="/var/run/fancontrol.pid"
 
 #DEBUG=1
 MAX=255
+SMOOTHED=-1
 
 function LoadConfig
 {
@@ -67,6 +68,8 @@ function LoadConfig
 	FCFANS=`egrep '^FCFANS=.*$' $1 | sed -e 's/FCFANS=//g'`
 	MINPWM=`egrep '^MINPWM=.*$' $1 | sed -e 's/MINPWM=//g'`
 	MAXPWM=`egrep '^MAXPWM=.*$' $1 | sed -e 's/MAXPWM=//g'`
+	THYST=`egrep '^THYST=.*$' $1 | sed -e 's/THYST=//g'`
+	SMOOTHING=`egrep '^SMOOTHING=.*$' $1 | sed -e 's/SMOOTHING=//g'`
 
 	# Check whether all mandatory settings are set
 	if [[ -z ${INTERVAL} || -z ${FCTEMPS} || -z ${MINTEMP} || -z ${MAXTEMP} || -z ${MINSTART} || -z ${MINSTOP} ]]
@@ -107,6 +110,10 @@ function LoadConfig
 		[ -z "${AFCMINPWM[$fcvcount]}" ] && AFCMINPWM[$fcvcount]=0
 		AFCMAXPWM[$fcvcount]=`echo $MAXPWM |sed -e 's/ /\n/g' |egrep "${AFCPWM[$fcvcount]}" |cut -d'=' -f2`
 		[ -z "${AFCMAXPWM[$fcvcount]}" ] && AFCMAXPWM[$fcvcount]=255
+		AFCTHYST[$fcvcount]=`echo $THYST |sed -e 's/ /\n/g' |egrep "${AFCPWM[$fcvcount]}" |cut -d'=' -f2`
+		[ -z "${AFCTHYST[$fcvcount]}" ] && AFCTHYST[$fcvcount]=0
+		AFCSMOOTHING[$fcvcount]=`echo $SMOOTHING |sed -e 's/ /\n/g' |egrep "${AFCPWM[$fcvcount]}" |cut -d'=' -f2`
+		[ -z "${AFCSMOOTHING[$fcvcount]}" ] && AFCSMOOTHING[$fcvcount]=0
 
 		# verify the validity of the settings
 		if [ "${AFCMINTEMP[$fcvcount]}" -ge "${AFCMAXTEMP[$fcvcount]}" ]
@@ -150,6 +157,8 @@ function LoadConfig
 		echo "  MINSTOP=${AFCMINSTOP[$fcvcount]}"
 		echo "  MINPWM=${AFCMINPWM[$fcvcount]}"
 		echo "  MAXPWM=${AFCMAXPWM[$fcvcount]}"
+		echo "  THYST=${AFCTHYST[$fcvcount]}"
+		echo "  SMOOTHING=${AFCSMOOTHING[$fcvcount]}"
 		let fcvcount=fcvcount+1
 	done
 	echo
@@ -448,11 +457,34 @@ function restorefans()
 trap 'restorefans 0' SIGQUIT SIGTERM
 trap 'restorefans 1' SIGHUP SIGINT
 
+function upperBound
+{
+    # $1: temperature
+    # $2: Tmin
+    # $3: Tmax
+    # $4: MinPWM
+    # $5: MaxPWM
+    # $6 Thyst
+    let a="-($5-$4)*($1-$3+$6)*($1-$3+$6)/($3-$2)/($3-$2)+$5"
+    return $a
+}
+function lowerBound
+{
+    # $1: temperature
+    # $2: Tmin
+    # $3: Tmax
+    # $4: MinPWM
+    # $5: MaxPWM
+    # $6 Thyst
+    let a="($5-$4)*($1-$2)*($1-$2)/($3-$2)/($3-$2)+$4"
+    return $a
+}
+
 # main function
 function UpdateFanSpeeds
 {
 	local fcvcount
-	local pwmo tsens fan mint maxt minsa minso minpwm maxpwm
+	local pwmo tsens fan mint maxt minsa minso minpwm maxpwm tHyst smoothing
 	local tval pwmpval fanval min_fanval one_fan one_fanval
 	local -i pwmval
 
@@ -469,7 +501,8 @@ function UpdateFanSpeeds
 		minso=${AFCMINSTOP[$fcvcount]}
 		minpwm=${AFCMINPWM[$fcvcount]}
 		maxpwm=${AFCMAXPWM[$fcvcount]}
-
+		smoothing=${AFCSMOOTHING[$fcvcount]}
+		tHyst=${AFCTHYST[$fcvcount]}
 		read tval < ${tsens}
 		if [ $? -ne 0 ]
 		then
@@ -477,13 +510,14 @@ function UpdateFanSpeeds
 			restorefans 1
 		fi
 
+		#smooth read value
 		read pwmpval < ${pwmo}
+		pwmval=`cat ${pwmo}`
 		if [ $? -ne 0 ]
 		then
 			echo "Error reading PWM value from $DIR/$pwmo"
 			restorefans 1
 		fi
-
 		# If fanspeed-sensor output shall be used, do it
 		if [[ -n ${fan} ]]
 		then
@@ -515,7 +549,6 @@ function UpdateFanSpeeds
 		else
 			min_fanval=1  # set it to a non zero value, so the rest of the script still works
 		fi
-
 		# debug info
 		if [ "$DEBUG" != "" ]
 		then
@@ -532,23 +565,58 @@ function UpdateFanSpeeds
 			echo "pwmpval=$pwmpval"
 			echo "fanval=$fanval"
 			echo "min_fanval=$min_fanval"
+			echo ""
+			echo ""
 		fi
-
 		if (( $tval <= $mint ))
 		  then pwmval=$minpwm # below min temp, use defined min pwm
 		elif (( $tval >= $maxt ))
 		  then pwmval=$maxpwm # over max temp, use defined max pwm
 		else
 		  # calculate the new value from temperature and settings
-		  pwmval="(${tval}-${mint})*(${maxpwm}-${minso})/(${maxt}-${mint})+${minso}"
-		  if [ $pwmpval -eq 0 -o $min_fanval -eq 0 ]
-		  then # if fan was stopped start it using a safe value
-		  	echo $minsa > $pwmo
-			# Sleep while still handling signals
-			sleep 1 &
-			wait
+		  #pwmval="(${tval}-${mint})*(${maxpwm}-${minso})/(${maxt}-${mint})+${minso}"
+		  #Here is the major change: the new controller has a hysterisis => there are two (quadratic) functions defining an lower and upper bound. If current state is in between those functions the fan speed won't get changed otherwise its changed to the bound it broke.
+		  #The intention is to smooth controlling. The size of the area between lower and upper bound can be adjusted using the new "hysterisis" parameter.
+
+		  lowerBound ${tval} ${mint} ${maxt} ${minpwm} ${maxpwm} ${tHyst}
+		  lb=$?
+		  upperBound ${tval} ${mint} ${maxt} ${minpwm} ${maxpwm} ${tHyst}
+		  ub=$?
+
+
+		  if [ "$pwmval" -gt "$ub" ]
+		  then
+                    pwmval=$ub
+		  else
+                    if [ "$pwmval" -lt "$lb" ]
+                    then
+                        pwmval=$lb
+                    fi
 		  fi
 		fi
+		#  echo "Temp:         $tval"
+		#  echo "UpperBound:   $ub"
+                #  echo "LowerBound:   $lb"
+		#  echo "PWMVal:       $pwmval"
+		#  echo "Minsa:		$minsa"
+		#  echo ""
+		#start smoothing with current fan speed
+		if [ $SMOOTHED -eq -1 ]
+		  then
+			let SMOOTHED=$pwmval*1000
+		  fi
+
+		  #do smoothing
+		  let SMOOTHED=$SMOOTHED*$smoothing+$pwmval*1000
+		  let tmp=$smoothing+1
+		  let SMOOTHED=$SMOOTHED/$tmp
+		  let pwmval=$SMOOTHED/1000
+
+		  if [ $pwmval -le $minsa ]
+		  then
+			pwmval=0
+		fi
+
 		echo $pwmval > $pwmo # write new value to pwm output
 		if [ $? -ne 0 ]
 		then
